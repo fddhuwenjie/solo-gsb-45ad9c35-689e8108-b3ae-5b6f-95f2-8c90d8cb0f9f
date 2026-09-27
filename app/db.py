@@ -1,10 +1,16 @@
-"""SQLite 持久层：不可变特征库版本与判定记录。
+"""SQLite 持久层：不可变特征库版本、判定记录与设备批次链。
 
 特征库以版本为单位不可变存储：
 
 - ``library_versions``：版本元数据，状态机 draft → active → historical；
 - ``library_version_aids``：每个版本的完整航标快照（版本不可变，可复算差异）；
 - ``library_state``：单行表，指向当前激活版本。
+
+设备批次链（每台设备一条仅追加链）：
+
+- ``device_batches``：批次记录，(device_id, batch_id) 与 (device_id, sequence) 唯一；
+- ``device_chain_state``：每设备单行链头（head_sequence/head_digest）与最近一次
+  接收事件（accepted/replayed），校验、追加与链头更新在同一事务内完成。
 
 首次启动时把旧版平铺 ``aids`` 表整体迁移为初始激活版本（source='migration'），
 并给 ``judgments`` 表补充 ``library_version`` 列；迁移在单个事务内完成。
@@ -52,6 +58,35 @@ CREATE TABLE IF NOT EXISTS judgments (
     request         TEXT NOT NULL,
     response        TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS device_batches (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id         TEXT NOT NULL,
+    batch_id          TEXT NOT NULL,
+    sequence          INTEGER NOT NULL,
+    previous_digest   TEXT NOT NULL,
+    digest            TEXT NOT NULL,
+    observation_count INTEGER NOT NULL,
+    tolerance         REAL NOT NULL,
+    max_drift         REAL NOT NULL,
+    max_missed        INTEGER NOT NULL,
+    max_false         INTEGER NOT NULL,
+    observations      TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'accepted' CHECK (status IN ('accepted')),
+    replay_count      INTEGER NOT NULL DEFAULT 0,
+    received_at       REAL NOT NULL,
+    last_replayed_at  REAL,
+    UNIQUE (device_id, batch_id),
+    UNIQUE (device_id, sequence)
+);
+CREATE TABLE IF NOT EXISTS device_chain_state (
+    device_id      TEXT PRIMARY KEY,
+    head_sequence  INTEGER NOT NULL,
+    head_digest    TEXT NOT NULL,
+    head_batch_id  TEXT NOT NULL,
+    last_status    TEXT NOT NULL CHECK (last_status IN ('accepted', 'replayed')),
+    last_batch_id  TEXT NOT NULL,
+    updated_at     REAL NOT NULL
+);
 """
 
 
@@ -65,6 +100,14 @@ class VersionStateError(Exception):
 
 class VersionConflict(Exception):
     """激活时草稿的 base_version 已不再是当前激活版本（乐观并发冲突）。"""
+
+
+class BatchConflict(Exception):
+    """批次与设备链冲突（载荷变化或链头过期）；detail 为结构化的 409 响应体。"""
+
+    def __init__(self, detail: dict):
+        super().__init__(detail["message"])
+        self.detail = detail
 
 
 def _iso(ts: float) -> str:
@@ -105,6 +148,7 @@ class Database:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn
 
     @contextmanager
@@ -398,3 +442,259 @@ class Database:
             "request": json.loads(r["request"]),
             "response": json.loads(r["response"]),
         }
+
+    # ---------------- 设备批次链 ----------------
+
+    @staticmethod
+    def _expected_of(state) -> dict:
+        """设备链当前期望的下一批序号与前序摘要（无链状态时为首批）。"""
+        if state is None:
+            return {"sequence": 1, "previous_digest": ""}
+        return {
+            "sequence": state["head_sequence"] + 1,
+            "previous_digest": state["head_digest"],
+        }
+
+    @staticmethod
+    def _conflict_detail(
+        device_id: str, state, req, previous_digest: str,
+        *, reason: str, message: str, conflict: dict | None = None,
+    ) -> dict:
+        detail = {
+            "error": "batch_conflict",
+            "reason": reason,
+            "message": message,
+            "device_id": device_id,
+            "expected": Database._expected_of(state),
+            "got": {
+                "batch_id": req.batch_id,
+                "sequence": req.sequence,
+                "previous_digest": previous_digest,
+            },
+        }
+        if conflict is not None:
+            detail["conflict"] = conflict
+        return detail
+
+    @staticmethod
+    def _touch_chain_state(conn, device_id: str, status: str, batch_id: str, now: float) -> None:
+        """更新设备链最近一次接收事件（重放不推进链头）。"""
+        conn.execute(
+            "UPDATE device_chain_state SET last_status = ?, last_batch_id = ?, updated_at = ? "
+            "WHERE device_id = ?",
+            (status, batch_id, now, device_id),
+        )
+
+    def _cursor_of(self, conn, device_id: str) -> dict:
+        state = conn.execute(
+            "SELECT * FROM device_chain_state WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if state is None:
+            return {
+                "device_id": device_id,
+                "head_sequence": 0,
+                "head_digest": "",
+                "head_batch_id": None,
+                "next_sequence": 1,
+                "expected_previous_digest": "",
+                "last_status": None,
+                "last_batch_id": None,
+                "updated_at": None,
+            }
+        return {
+            "device_id": device_id,
+            "head_sequence": state["head_sequence"],
+            "head_digest": state["head_digest"],
+            "head_batch_id": state["head_batch_id"],
+            "next_sequence": state["head_sequence"] + 1,
+            "expected_previous_digest": state["head_digest"],
+            "last_status": state["last_status"],
+            "last_batch_id": state["last_batch_id"],
+            "updated_at": _iso(state["updated_at"]),
+        }
+
+    @staticmethod
+    def _batch_record(row, *, include_observations: bool = False) -> dict:
+        record = {
+            "device_id": row["device_id"],
+            "batch_id": row["batch_id"],
+            "sequence": row["sequence"],
+            "previous_digest": row["previous_digest"],
+            "digest": row["digest"],
+            "observation_count": row["observation_count"],
+            "tolerance": row["tolerance"],
+            "max_drift": row["max_drift"],
+            "max_missed": row["max_missed"],
+            "max_false": row["max_false"],
+            "status": row["status"],
+            "replay_count": row["replay_count"],
+            "received_at": _iso(row["received_at"]),
+            "last_replayed_at": (
+                _iso(row["last_replayed_at"]) if row["last_replayed_at"] is not None else None
+            ),
+        }
+        if include_observations:
+            record["observations"] = json.loads(row["observations"])
+        return record
+
+    def append_batch(self, device_id: str, req, *, digest: str) -> dict:
+        """单事务追加设备批次：幂等重放判定、链头校验、插入记录并推进链头。
+
+        相同 batch_id/sequence 且载荷一致的重放返回原记录（status='replayed'）；
+        载荷变化或链头过期抛出 BatchConflict（detail 含链头期望值）。
+        BEGIN IMMEDIATE 串行化并发写，并发提交不会形成分叉。
+        """
+        previous_digest = req.previous_digest or ""
+        observations = [
+            {"captured_at": o.captured_at, "local_id": o.local_id} for o in req.observations
+        ]
+        now = time.time()
+        with self._write_tx() as conn:
+            state = conn.execute(
+                "SELECT * FROM device_chain_state WHERE device_id = ?", (device_id,)
+            ).fetchone()
+
+            by_batch = conn.execute(
+                "SELECT * FROM device_batches WHERE device_id = ? AND batch_id = ?",
+                (device_id, req.batch_id),
+            ).fetchone()
+            if by_batch is not None:
+                if by_batch["digest"] == digest and by_batch["previous_digest"] == previous_digest:
+                    # 相同载荷重放：不追加记录，累计重放次数并返回原结果
+                    conn.execute(
+                        "UPDATE device_batches SET replay_count = replay_count + 1, "
+                        "last_replayed_at = ? WHERE id = ?",
+                        (now, by_batch["id"]),
+                    )
+                    self._touch_chain_state(conn, device_id, "replayed", req.batch_id, now)
+                    row = conn.execute(
+                        "SELECT * FROM device_batches WHERE id = ?", (by_batch["id"],)
+                    ).fetchone()
+                    result = {
+                        "status": "replayed",
+                        "batch": self._batch_record(row),
+                        "cursor": self._cursor_of(conn, device_id),
+                    }
+                else:
+                    raise BatchConflict(
+                        self._conflict_detail(
+                            device_id, state, req, previous_digest,
+                            reason="payload_mismatch",
+                            message=(
+                                f"batch_id {req.batch_id!r} already exists on device "
+                                f"{device_id!r} with a different payload"
+                            ),
+                            conflict={
+                                "field": "batch_id",
+                                "existing": {
+                                    "batch_id": by_batch["batch_id"],
+                                    "sequence": by_batch["sequence"],
+                                    "digest": by_batch["digest"],
+                                    "previous_digest": by_batch["previous_digest"],
+                                },
+                            },
+                        )
+                    )
+            else:
+                by_seq = conn.execute(
+                    "SELECT * FROM device_batches WHERE device_id = ? AND sequence = ?",
+                    (device_id, req.sequence),
+                ).fetchone()
+                if by_seq is not None:
+                    # 序号已被其他 batch_id 占用（载荷一致必然 batch_id 也一致，已命中上一分支）
+                    raise BatchConflict(
+                        self._conflict_detail(
+                            device_id, state, req, previous_digest,
+                            reason="payload_mismatch",
+                            message=(
+                                f"sequence {req.sequence} on device {device_id!r} is already "
+                                f"taken by batch_id {by_seq['batch_id']!r}"
+                            ),
+                            conflict={
+                                "field": "sequence",
+                                "existing": {
+                                    "batch_id": by_seq["batch_id"],
+                                    "sequence": by_seq["sequence"],
+                                    "digest": by_seq["digest"],
+                                    "previous_digest": by_seq["previous_digest"],
+                                },
+                            },
+                        )
+                    )
+                expected = self._expected_of(state)
+                if (
+                    req.sequence != expected["sequence"]
+                    or previous_digest != expected["previous_digest"]
+                ):
+                    raise BatchConflict(
+                        self._conflict_detail(
+                            device_id, state, req, previous_digest,
+                            reason="stale_chain_head",
+                            message=(
+                                f"batch does not extend the current chain head of device "
+                                f"{device_id!r}: expected sequence {expected['sequence']} "
+                                f"with previous_digest {expected['previous_digest']!r}"
+                            ),
+                        )
+                    )
+                conn.execute(
+                    "INSERT INTO device_batches "
+                    "(device_id, batch_id, sequence, previous_digest, digest, "
+                    "observation_count, tolerance, max_drift, max_missed, max_false, "
+                    "observations, status, replay_count, received_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', 0, ?)",
+                    (
+                        device_id, req.batch_id, req.sequence, previous_digest, digest,
+                        len(observations), req.tolerance, req.max_drift, req.max_missed,
+                        req.max_false, json.dumps(observations, ensure_ascii=False), now,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO device_chain_state "
+                    "(device_id, head_sequence, head_digest, head_batch_id, last_status, "
+                    "last_batch_id, updated_at) VALUES (?, ?, ?, ?, 'accepted', ?, ?) "
+                    "ON CONFLICT(device_id) DO UPDATE SET "
+                    "head_sequence = excluded.head_sequence, "
+                    "head_digest = excluded.head_digest, "
+                    "head_batch_id = excluded.head_batch_id, "
+                    "last_status = 'accepted', "
+                    "last_batch_id = excluded.last_batch_id, "
+                    "updated_at = excluded.updated_at",
+                    (device_id, req.sequence, digest, req.batch_id, req.batch_id, now),
+                )
+                row = conn.execute(
+                    "SELECT * FROM device_batches WHERE device_id = ? AND batch_id = ?",
+                    (device_id, req.batch_id),
+                ).fetchone()
+                result = {
+                    "status": "accepted",
+                    "batch": self._batch_record(row),
+                    "cursor": self._cursor_of(conn, device_id),
+                }
+        return result
+
+    def get_device_cursor(self, device_id: str) -> dict:
+        """设备批次链游标；设备尚无批次时返回初始游标（首批期望值）。"""
+        with closing(self._connect()) as conn:
+            return self._cursor_of(conn, device_id)
+
+    def list_device_batches(
+        self, device_id: str, *, limit: int = 50, offset: int = 0
+    ) -> list[dict]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM device_batches WHERE device_id = ? "
+                "ORDER BY sequence LIMIT ? OFFSET ?",
+                (device_id, limit, offset),
+            ).fetchall()
+            return [self._batch_record(r) for r in rows]
+
+    def get_device_batch(self, device_id: str, batch_id: str) -> dict | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM device_batches WHERE device_id = ? AND batch_id = ?",
+                (device_id, batch_id),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._batch_record(row, include_observations=True)

@@ -106,6 +106,65 @@ class PatrolWindowIn(BaseModel):
         return v
 
 
+class BatchObservationIn(BaseModel):
+    """批次内一条观测：采集时间戳 + 设备本地观测编号。"""
+
+    captured_at: float = Field(description="采集时间戳（Unix 秒）")
+    local_id: str = Field(min_length=1, max_length=64, description="设备本地观测编号")
+
+    @field_validator("captured_at")
+    @classmethod
+    def _captured_at_finite(cls, v: float) -> float:
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("captured_at must be a finite number")
+        return v
+
+
+class DeviceBatchIn(BaseModel):
+    """现场设备观测批次：链式追加，只保存观测时间戳与 /judge 四项阈值，不在服务端判定。
+
+    sequence 从 1 起逐批递增；previous_digest 引用前序批次摘要（首批为空或缺省）；
+    observations 按 (captured_at, local_id) 严格递增。
+    """
+
+    batch_id: str = Field(min_length=1, max_length=128, description="批次编号（设备内唯一）")
+    sequence: int = Field(ge=1, description="批次序号，从 1 起逐批递增")
+    previous_digest: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="前序批次摘要（SHA-256 小写十六进制）；首批为空或缺省",
+    )
+    observations: list[BatchObservationIn] = Field(
+        min_length=1,
+        max_length=100,
+        description="观测列表（1~100 条，按 (captured_at, local_id) 严格递增）",
+    )
+    tolerance: float = Field(gt=0, description="时间容差，秒（同 /judge，仅保存不判定）")
+    max_drift: float = Field(ge=0, lt=1, description="最大线性钟漂（同 /judge，仅保存不判定）")
+    max_missed: int = Field(ge=0, description="漏记上限（同 /judge，仅保存不判定）")
+    max_false: int = Field(ge=0, description="误记上限（同 /judge，仅保存不判定）")
+
+    @field_validator("previous_digest")
+    @classmethod
+    def _previous_digest_format(cls, v: Optional[str]) -> Optional[str]:
+        if v:
+            if len(v) != 64 or any(c not in "0123456789abcdef" for c in v):
+                raise ValueError(
+                    "previous_digest must be empty or a 64-char lowercase hex SHA-256 digest"
+                )
+        return v
+
+    @field_validator("observations")
+    @classmethod
+    def _observations_sorted(cls, v: list[BatchObservationIn]) -> list[BatchObservationIn]:
+        keys = [(o.captured_at, o.local_id) for o in v]
+        if any(cur <= prev for prev, cur in zip(keys, keys[1:])):
+            raise ValueError(
+                "observations must be strictly ascending by (captured_at, local_id)"
+            )
+        return v
+
+
 class PatrolAnalyzeRequest(BaseModel):
     """巡检整体核对请求：计划航线 + 观测窗口序列 + 与 /judge 相同的判定参数。"""
 

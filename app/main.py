@@ -1,12 +1,14 @@
 """航标闪光巡检判定服务（FastAPI 应用入口）。"""
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Path, Query, Response
 
 from . import config
 from .align import AidPattern, judge
-from .db import Database, VersionConflict, VersionNotFound, VersionStateError
+from .batches import canonical_payload, compute_digest
+from .db import BatchConflict, Database, VersionConflict, VersionNotFound, VersionStateError
 from .models import (
+    DeviceBatchIn,
     JudgeRequest,
     LibraryImportRequest,
     PatrolAnalyzeRequest,
@@ -24,8 +26,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "巡检整体核对把一次巡检的多个观测窗口用动态规划全局分配到计划航线航点。"
             "服务端特征库以不可变版本发布：草稿提交后可查询增删改差异，"
             "激活时单事务校验 base_version 仍是当前版本，冲突返回 409。"
+            "现场设备以批次链上传观测：每批含递增序号、唯一批次号与前序摘要，"
+            "服务端单事务校验链头并追加，相同载荷重放幂等返回原结果，"
+            "载荷变化或链头过期返回 409 及期望值；只保存观测与判定阈值，不在上传时判定。"
         ),
-        version="1.2.0",
+        version="1.3.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -306,6 +311,73 @@ def create_app(db_path: str | None = None) -> FastAPI:
         row = app.state.db.get_judgment(judgment_id)
         if row is None:
             raise HTTPException(status_code=404, detail="judgment not found")
+        return row
+
+    # ---------------- 现场设备批次链 ----------------
+
+    @app.post(
+        "/field-devices/{device_id}/batches",
+        status_code=201,
+        summary="追加设备观测批次（链式、幂等，只保存不判定）",
+        description=(
+            "每批含从 1 递增的 sequence、设备内唯一 batch_id、previous_digest 与 "
+            "1~100 条按 (captured_at, local_id) 严格递增的观测；服务端保存观测时间戳与 "
+            "/judge 四项阈值，不做判定。批次摘要由服务端计算：排除摘要字段，以 UTF-8 "
+            "键序紧凑 JSON 求 SHA-256。首批 previous_digest 为空，后续批次必须引用当前"
+            "链头；相同载荷重放返回原结果（status=replayed，HTTP 200），载荷变化或链头"
+            "过期返回 409 及期望值。校验、追加记录与链头更新在同一 SQLite 事务内完成，"
+            "并发提交不会形成分叉。"
+        ),
+    )
+    def append_device_batch(
+        req: DeviceBatchIn,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        digest = compute_digest(canonical_payload(device_id, req))
+        try:
+            result = app.state.db.append_batch(device_id, req, digest=digest)
+        except BatchConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        if result["status"] == "replayed":
+            response.status_code = 200
+        return result
+
+    @app.get(
+        "/field-devices/{device_id}/cursor",
+        summary="查询设备批次链游标（链头与下一批期望值）",
+        description=(
+            "返回链头序号/摘要、下一批应使用的 sequence 与 previous_digest，"
+            "以及最近一次接收事件（last_status 区分 accepted 与 replayed）；"
+            "设备尚无批次时返回初始游标（sequence=1、previous_digest 为空）。"
+        ),
+    )
+    def get_device_cursor(device_id: str = Path(min_length=1, max_length=128)) -> dict:
+        return app.state.db.get_device_cursor(device_id)
+
+    @app.get(
+        "/field-devices/{device_id}/batches",
+        summary="查询设备批次列表（按序号递增，分页）",
+    )
+    def list_device_batches(
+        device_id: str = Path(min_length=1, max_length=128),
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> dict:
+        rows = app.state.db.list_device_batches(device_id, limit=limit, offset=offset)
+        return {"device_id": device_id, "count": len(rows), "batches": rows}
+
+    @app.get(
+        "/field-devices/{device_id}/batches/{batch_id}",
+        summary="查询单条批次详情（含观测与阈值）",
+    )
+    def get_device_batch(
+        device_id: str = Path(min_length=1, max_length=128),
+        batch_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        row = app.state.db.get_device_batch(device_id, batch_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="batch not found")
         return row
 
     return app
