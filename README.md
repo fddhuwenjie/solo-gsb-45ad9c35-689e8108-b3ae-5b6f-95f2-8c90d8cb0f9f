@@ -15,6 +15,14 @@
 计算增删改差异；激活在单个 SQLite 事务内确认基线仍是当前版本后原子切换，
 冲突返回 409；历史版本不可改，可作为回退时新草稿的来源。
 
+现场设备通过 `POST /field-devices/{device_id}/batches` 以**链式批次**上传观测：
+每批含从 1 递增的 `sequence`、设备内唯一的 `batch_id`、引用上一批摘要的
+`previous_digest` 和 1～100 条按 `(captured_at, local_id)` 递增的观测；服务端
+只保存观测时间戳与 `/judge` 四项阈值（不判定），并对排除摘要字段的规范化载荷
+计算 SHA-256 作为批次摘要。校验、追加记录、更新设备链头在**单个 SQLite 事务**
+内完成：相同载荷重放返回原结果（`status=replayed`），载荷变化或链头过期返回
+409 及期望值，并发提交不会形成分叉。
+
 ## 快速开始
 
 单条命令启动（唯一前置要求：Docker 与 Docker Compose）：
@@ -61,6 +69,10 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `POST` | `/patrols/analyze` | 巡检整体核对：观测窗口全局分配到计划航线航点（固定激活版本，不落库） |
 | `GET` | `/judgments` | 查询判定记录（`limit`/`offset` 分页，按时间倒序） |
 | `GET` | `/judgments/{id}` | 查询单条判定记录详情（含完整请求与响应） |
+| `POST` | `/field-devices/{device_id}/batches` | 上传设备观测批次：链式追加、只保存不判定；重放返回原结果，冲突 409 |
+| `GET` | `/field-devices/{device_id}/cursor` | 查询设备批次链游标（链头摘要与下一批期望值） |
+| `GET` | `/field-devices/{device_id}/batches` | 按 `after_sequence` 游标分页列出设备批次（含受理状态） |
+| `GET` | `/field-devices/{device_id}/batches/{sequence}` | 查询单条批次详情（观测时间戳与 `/judge` 四项阈值） |
 
 ### 1. 导入特征库（原子发布新版本）
 
@@ -229,6 +241,128 @@ curl -s http://localhost:8000/judgments?limit=10
 curl -s http://localhost:8000/judgments/1
 ```
 
+### 6. 现场设备批次链（断网续传与冲突恢复）
+
+现场设备把观测按**批次链**上传：每台设备一条链，`sequence` 从 1 递增，
+`previous_digest` 引用上一批摘要（首批为空串 `""`）。服务端只保存观测时间戳
+与 `/judge` 四项阈值（`tolerance`/`max_drift`/`max_missed`/`max_false`），
+**不做判定**；判定仍通过 `/judge` 或 `/patrols/analyze` 显式发起。
+
+**请求体**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `batch_id` | `string`（1~128） | 客户端生成的批次编号，设备内唯一 |
+| `sequence` | `int≥1` | 批次序号，从 1 递增，必须等于链头序号 + 1 |
+| `previous_digest` | `string` | 上一批摘要（64 位十六进制）；首批为空串 `""` |
+| `observations` | `object[]`（1~100） | 观测，按 `(captured_at, local_id)` 严格递增；`captured_at` 为采集时刻（Unix 秒），`local_id` 为设备本地编号 |
+| `tolerance` | `float>0` | 时间容差（秒），同 `/judge` |
+| `max_drift` | `float∈[0,1)` | 最大线性钟漂（无量纲，s/s），同 `/judge` |
+| `max_missed` / `max_false` | `int≥0` | 漏记/误记上限，同 `/judge` |
+
+**批次摘要（SHA-256）**：服务端对**排除摘要字段**（`previous_digest`）的规范化
+载荷计算摘要——字段为 `batch_id`、`device_id`、`sequence`、`observations`
+（`captured_at`/`local_id`）与四项阈值；JSON 序列化采用 **UTF-8 键序**
+（键按 UTF-8 序排序）与**紧凑分隔符**（`,`/`:`，无空白），UTF-8 编码后取
+SHA-256 十六进制小写。客户端可按同一规则独立复算：
+
+```python
+import hashlib, json
+payload = {
+    "batch_id": "b-001", "device_id": "dev-01", "sequence": 1,
+    "observations": [{"captured_at": 1700000000.0, "local_id": "o001"}],
+    "tolerance": 0.5, "max_drift": 0.0005, "max_missed": 3, "max_false": 3,
+}
+blob = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                  separators=(",", ":")).encode("utf-8")
+digest = hashlib.sha256(blob).hexdigest()
+```
+
+**上传与链式追加**：
+
+```bash
+# 首批：previous_digest 为空
+curl -s -X POST http://localhost:8000/field-devices/dev-01/batches \
+  -H 'Content-Type: application/json' -d '{
+    "batch_id": "b-001", "sequence": 1, "previous_digest": "",
+    "observations": [
+      {"local_id": "o001", "captured_at": 1700000000.0},
+      {"local_id": "o002", "captured_at": 1700000000.5}
+    ],
+    "tolerance": 0.5, "max_drift": 0.0005, "max_missed": 3, "max_false": 3
+  }'
+# → 201 {"status": "accepted", "digest": "49740f…", "chain": {"next_sequence": 2,
+#        "expected_previous_digest": "49740f…", …}, …}
+
+# 后续批次：previous_digest 引用上一批摘要（即响应中的 digest）
+curl -s -X POST http://localhost:8000/field-devices/dev-01/batches \
+  -H 'Content-Type: application/json' -d '{
+    "batch_id": "b-002", "sequence": 2,
+    "previous_digest": "49740fb763c71461617735f601caeb89cc114aabc76e5dcd79ec05045767016a",
+    "observations": [{"local_id": "o003", "captured_at": 1700000001.0}],
+    "tolerance": 0.5, "max_drift": 0.0005, "max_missed": 3, "max_false": 3
+  }'
+```
+
+校验、追加记录、更新设备链头在**单个 SQLite 事务**内完成；写串行化加
+`(device_id, sequence)`、`(device_id, batch_id)` 唯一约束兜底，并发提交
+不会形成分叉（同一序号只会有一个批次被接受，其余收到 409）。
+
+**幂等重放**：以相同载荷重发同一 `batch_id`（或同一序号）时，服务端返回
+**原结果**，仅 `status` 标记为 `replayed`（HTTP 200），链头与记录数不变；
+新接受的批次为 `status=accepted`（HTTP 201）。上传响应与批次查询（列表/
+详情）响应均带 `status` 字段，区分 `accepted` 与 `replayed`，重试安全。
+
+**断网续传**：设备离线期间在本地缓存批次；恢复联网后先查游标，从
+`next_sequence` 与 `expected_previous_digest` 续传，已送达的批次按幂等
+重放处理，不会产生重复记录：
+
+```bash
+# 查询服务端链头：下一批该用哪个 sequence 与 previous_digest
+curl -s http://localhost:8000/field-devices/dev-01/cursor
+# → {"last_sequence": 2, "head_digest": "5e7aa3…", "next_sequence": 3,
+#    "expected_previous_digest": "5e7aa3…", "batch_count": 2, …}
+
+# 断网期间未确认的批次原样重发：若服务端已接受，返回原结果且 status=replayed
+curl -s -X POST http://localhost:8000/field-devices/dev-01/batches \
+  -H 'Content-Type: application/json' -d '<与上次完全相同的请求体>'
+# → 200 {"status": "replayed", "digest": "5e7aa3…", …}
+```
+
+**冲突恢复（409）**：响应 `detail` 携带期望值，设备据此对齐链头后重发：
+
+```json
+{
+  "detail": {
+    "error": "batch_conflict",
+    "reason": "stale_chain_head",
+    "message": "batch does not extend the chain head: …",
+    "expected_sequence": 3,
+    "expected_previous_digest": "5e7aa3…"
+  }
+}
+```
+
+- `reason=stale_chain_head`（链头过期）：`sequence` 或 `previous_digest` 不是
+  当前链头的后继。用 `expected_sequence` 与 `expected_previous_digest` 重建
+  批次重发；若本地链与服务端不一致，以 `GET /field-devices/{device_id}/batches`
+  分页核对服务端已接受的批次；
+- `reason=payload_changed`（载荷变化）：同一 `batch_id` 或序号已以**不同**载荷
+  记录。`detail.existing_batch` 给出既有批次的 `sequence`/`batch_id`/`digest`，
+  可用 `GET /field-devices/{device_id}/batches/{sequence}` 核对内容；确认已
+  送达后跳到下一批，切勿以新载荷覆盖原编号。
+
+**游标与批次查询**：
+
+```bash
+# 分页列出批次（after_sequence 为上一页响应的 next_cursor）
+curl -s "http://localhost:8000/field-devices/dev-01/batches?limit=2"
+curl -s "http://localhost:8000/field-devices/dev-01/batches?after_sequence=2&limit=2"
+
+# 单条批次详情：观测时间戳与 /judge 四项阈值
+curl -s http://localhost:8000/field-devices/dev-01/batches/2
+```
+
 ## 判定模型与裁决规则
 
 **观测模型**：观测时钟相对真时存在线性钟漂与固定相位差，
@@ -278,7 +412,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API 共 38 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链共 52 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 
@@ -289,8 +423,9 @@ app/
   main.py    FastAPI 路由与应用工厂
   align.py   相位-钟漂联合估计与循环对齐核心算法
   patrol.py  巡检整体核对：窗口合格候选 + 全局最优分配动态规划
+  batches.py 现场设备批次：规范化载荷与 SHA-256 链式摘要
   models.py  请求数据模型（Pydantic）
-  db.py      SQLite 持久层（不可变特征库版本 + 判定记录，含首次迁移）
+  db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 设备批次链，含首次迁移）
   config.py  环境变量配置
 samples/
   library.json                示例特征库
